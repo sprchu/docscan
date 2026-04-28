@@ -1,227 +1,419 @@
-use std::fs::File;
-use std::io::Read;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+mod app;
+mod command;
+mod scan;
+mod ui;
 
-use anyhow::{Context, Result};
-use calamine::{Reader, open_workbook_auto};
-use cfb::CompoundFile;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
+
+use app::{App, FileType, Focus, Mode, ScanResult};
 use clap::Parser;
-use colored::*;
-use indicatif::{ProgressBar, ProgressStyle};
-use memchr::memmem;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 use walkdir::WalkDir;
-use zip::ZipArchive;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "word/excel/pdf 文档搜索工具")]
 struct Args {
     #[arg(short, help = "待搜索字符串")]
-    query: String,
+    query: Option<String>,
 
     #[arg(short, default_value_t = num_cpus::get(), help = "并发线程数")]
     jobs: usize,
 
-    #[arg(short, long, default_value_t = false, help = "是否搜素PDF文件")]
+    #[arg(short, long, default_value_t = false, help = "是否搜索PDF文件")]
     pdf: bool,
 
-    #[arg(required = true, help = "扫描目录列表")]
+    #[arg(help = "扫描目录列表")]
     dirs: Vec<String>,
 }
 
 fn main() {
     let args = Args::parse();
-    let keyword = args.query;
-    let utf16_pattern = to_utf16le_bytes(&keyword);
-    let utf8_pattern = keyword.as_bytes();
 
-    // 初始化线程池
-    ThreadPoolBuilder::new()
-        .num_threads(args.jobs)
-        .build_global()
-        .expect("无法创建全局线程池");
-
-    println!(
-        "{} {}\n{} {}",
-        "🔍 搜索字符串:".blue(),
-        keyword.yellow().bold(),
-        "📂 扫描目录:".blue(),
-        args.dirs.join(" ").green()
+    let mut terminal = ratatui::init();
+    let mut app = App::new(
+        args.query.unwrap_or_default(),
+        args.jobs,
+        args.dirs,
+        args.pdf,
     );
-    println!("⚙️ 使用线程数: {}", args.jobs);
 
-    let start_time = Instant::now();
+    let result = run_app(&mut terminal, &mut app);
 
-    // 收集文件
-    let files: Vec<_> = args
-        .dirs
-        .iter()
-        .flat_map(|d| {
-            WalkDir::new(d)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    let path = e.path();
-                    if !path.is_file() {
-                        return false;
-                    }
-                    path.extension().map_or(false, |ext| {
-                        matches!(
-                            ext.to_str().unwrap_or("").to_lowercase().as_str(),
-                            "docx" | "wps" | "doc" | "xlsx" | "xls" | "et" | "pdf"
-                        )
-                    })
-                })
-        })
-        .collect();
-
-    let total = files.len() as u64;
-    if total == 0 {
-        println!("{}", "⚠️ 未在指定目录中找到支持的文档文件。".yellow());
-        return;
+    ratatui::restore();
+    if let Err(e) = result {
+        eprintln!("Error: {}", e);
     }
+}
 
-    // 初始化进度条
-    let pb = ProgressBar::new(total);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({per_sec})",
-        )
-        .unwrap()
-        .progress_chars("=>-"),
-    );
+fn run_app<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    app: &mut App,
+) -> anyhow::Result<()>
+where
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
+{
+    let (scan_tx, scan_rx): (mpsc::Sender<ScanMessage>, mpsc::Receiver<ScanMessage>) =
+        mpsc::channel();
 
-    let hit_count = AtomicUsize::new(0);
+    let mut first_frame = true;
 
-    // 并行处理文件
-    files.par_iter().for_each(|entry| {
-        let path = entry.path();
-        let path_str = path.to_string_lossy(); // 避免非 UTF-8 路径导致的 panic
-        let ext = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_lowercase();
+    loop {
+        terminal.draw(|f| ui::render(f, app))?;
 
-        let hit = match ext.as_str() {
-            "docx" => search_docx(&path_str, &keyword).unwrap_or(false),
-            "doc" | "wps" => search_doc(&path_str, &utf16_pattern, utf8_pattern).unwrap_or(false),
-            "xlsx" | "xls" | "et" => search_excel(&path_str, &keyword).unwrap_or(false),
-            "pdf" => args
-                .pdf
-                .then(|| search_pdf(&path_str, &keyword).unwrap_or(false))
-                .unwrap_or(false),
-            _ => false,
-        };
-
-        if hit {
-            hit_count.fetch_add(1, Ordering::Relaxed);
-
-            pb.println(format!(
-                "{} {}",
-                "📄 命中:".green().bold(),
-                path.display().to_string().bold()
-            ));
+        if first_frame {
+            first_frame = false;
+            if app.auto_scan {
+                app.auto_scan = false;
+                start_scan(app, &scan_tx);
+            }
         }
 
-        pb.inc(1);
-    });
-
-    pb.finish_and_clear();
-
-    let duration = start_time.elapsed();
-
-    println!(
-        "{} {} 个文件",
-        "✅ 命中数量:".green().bold(),
-        hit_count.load(Ordering::Relaxed)
-    );
-
-    println!("{} {:.2?}", "⏱ 总耗时:".blue().bold(), duration);
-    println!("{}", "🎉 搜索完成!".blue());
-}
-
-/// 将字符串转换为 UTF-16LE 字节序列
-fn to_utf16le_bytes(s: &str) -> Vec<u8> {
-    s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
-}
-
-/// 搜索 DOCX (过滤 XML 标签，防止因字体/样式改变导致搜索词被打断)
-fn search_docx(path: &str, keyword: &str) -> Result<bool> {
-    let file = File::open(path)?;
-    let mut archive = ZipArchive::new(file)?;
-
-    let mut xml = String::new();
-    if let Ok(mut f) = archive.by_name("word/document.xml") {
-        f.read_to_string(&mut xml)
-            .context("读取 document.xml 失败")?;
-    } else {
-        return Ok(false);
-    }
-
-    // 剥离 XML 标签，提取纯文本
-    let mut pure_text = String::with_capacity(xml.len() / 2);
-    let mut in_tag = false;
-    for c in xml.chars() {
-        if c == '<' {
-            in_tag = true;
-        } else if c == '>' {
-            in_tag = false;
-        } else if !in_tag {
-            pure_text.push(c);
-        }
-    }
-
-    Ok(pure_text.contains(keyword))
-}
-
-/// 搜索老版本 DOC/WPS 文件
-fn search_doc(path: &str, keyword_utf16: &[u8], keyword_utf8: &[u8]) -> Result<bool> {
-    let file = File::open(path)?;
-    let mut comp = CompoundFile::open(file)?;
-
-    let mut stream = comp.open_stream("WordDocument")?;
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf)?;
-
-    // 同时搜索 UTF-16LE 和 UTF-8/ANSI 格式的字节
-    // 老式 DOC 文件中有时英文/简单文本以单字节形式存在
-    Ok(memmem::find(&buf, keyword_utf16).is_some() || memmem::find(&buf, keyword_utf8).is_some())
-}
-
-/// 搜索 Excel 文件
-fn search_excel(path: &str, keyword: &str) -> Result<bool> {
-    let mut workbook = open_workbook_auto(path)?;
-
-    for sheet_name in workbook.sheet_names().to_owned() {
-        if let Ok(range) = workbook.worksheet_range(&sheet_name) {
-            for row in range.rows() {
-                for cell in row {
-                    if cell.to_string().contains(keyword) {
-                        return Ok(true);
+        while let Ok(msg) = scan_rx.try_recv() {
+            match msg {
+                ScanMessage::Progress { scanned, total } => {
+                    app.scanned_files = scanned;
+                    app.total_files = total;
+                }
+                ScanMessage::Hit(result) => {
+                    app.results.push(result);
+                }
+                ScanMessage::Done { dirs, total } => {
+                    app.scanning = false;
+                    app.total_files = total;
+                    if app.results.is_empty() {
+                        if total == 0 {
+                            app.message = format!(
+                                "No supported files found in [{}]. Check dirs and file types.",
+                                dirs.join(", ")
+                            );
+                        } else {
+                            app.message = format!(
+                                "No matches for '{}' in {} files across [{}].",
+                                app.query,
+                                total,
+                                dirs.join(", ")
+                            );
+                        }
+                    } else {
+                        app.message = format!(
+                            "Done: {} hits in {} files across [{}].",
+                            app.results.len(),
+                            total,
+                            dirs.join(", ")
+                        );
                     }
                 }
             }
         }
-    }
 
-    Ok(false)
-}
+        if app.should_quit {
+            return Ok(());
+        }
 
-/// 搜索 PDF 文件
-fn search_pdf(path: &str, keyword: &str) -> Result<bool> {
-    let doc = lopdf::Document::load(path)?;
-    for page in doc.get_pages() {
-        let text = doc.extract_text(&[page.0])?;
-        let res: String = text
-            .chars()
-            .filter(|c| !matches!(c, ' ' | '\n' | '\r'))
-            .collect();
-        if res.contains(keyword) {
-            return Ok(true);
+        if event::poll(Duration::from_millis(100))? {
+            let event = event::read()?;
+            if let Event::Key(key) = event {
+                if key.kind == KeyEventKind::Release {
+                    continue;
+                }
+                match app.mode {
+                    Mode::Command => handle_command_input(app, key.code),
+                    Mode::Help => {
+                        app.mode = Mode::Normal;
+                    }
+                    Mode::Normal => handle_normal_input(app, key, &scan_tx),
+                }
+            }
         }
     }
-    Ok(false)
+}
+
+enum ScanMessage {
+    Progress { scanned: usize, total: usize },
+    Hit(ScanResult),
+    Done { dirs: Vec<String>, total: usize },
+}
+
+// ==================== 输入处理 ====================
+//
+// Tab         = 循环焦点: ConfigLeft → ConfigRight → Results → ConfigLeft
+// ↑/↓         = ConfigLeft: 选择参数行 / ConfigRight: 浏览路径 / Results: 浏览结果
+// ←/→         = ConfigLeft: 调整参数 / ConfigRight: —
+// Space       = ConfigLeft+Types: 切换文件类型
+// Enter       = ConfigLeft/ConfigRight: 开始扫描 / Results: 打开文件
+// :           = 命令模式
+// q           = 退出
+
+fn handle_normal_input(
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+    scan_tx: &mpsc::Sender<ScanMessage>,
+) {
+    // Global keys
+    match key.code {
+        KeyCode::Char('q') => {
+            app.should_quit = true;
+            return;
+        }
+        KeyCode::Char(':') => {
+            app.enter_command_mode();
+            return;
+        }
+        KeyCode::Tab => {
+            app.focus = app.focus.next();
+            // Clamp selections when switching to panels
+            match app.focus {
+                Focus::ConfigRight => {
+                    if app.dir_selected >= app.dirs.len().saturating_sub(1) {
+                        app.dir_selected = app.dirs.len().saturating_sub(1);
+                    }
+                }
+                Focus::Results => {
+                    let max = app.filtered_results().len().saturating_sub(1);
+                    if app.selected > max {
+                        app.selected = max;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    match app.focus {
+        Focus::ConfigLeft => handle_config_left(app, key, scan_tx),
+        Focus::ConfigRight => handle_config_right(app, key, scan_tx),
+        Focus::Results => handle_results(app, key, scan_tx),
+    }
+}
+
+fn handle_config_left(
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+    scan_tx: &mpsc::Sender<ScanMessage>,
+) {
+    match key.code {
+        KeyCode::Up => app.config_left_row_up(),
+        KeyCode::Down => app.config_left_row_down(),
+
+        KeyCode::Enter => start_scan(app, scan_tx),
+
+        _ => match app.config_left_row {
+            // ── Keyword row ──
+            0 => match key.code {
+                KeyCode::Left => app.move_query_cursor_left(),
+                KeyCode::Right => app.move_query_cursor_right(),
+                KeyCode::Backspace => app.delete_query_char(),
+                KeyCode::Char(c) => app.insert_query_char(c),
+                _ => {}
+            },
+
+            // ── Threads row ──
+            1 => match key.code {
+                KeyCode::Left => app.threads_dec(),
+                KeyCode::Right => app.threads_inc(),
+                _ => {}
+            },
+
+            // ── File types row ──
+            2 => match key.code {
+                KeyCode::Left => app.ft_cursor_left(),
+                KeyCode::Right => app.ft_cursor_right(),
+                KeyCode::Char(' ') => app.toggle_file_type(app.ft_cursor),
+                _ => {}
+            },
+
+            _ => {}
+        },
+    }
+}
+
+fn handle_config_right(
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+    scan_tx: &mpsc::Sender<ScanMessage>,
+) {
+    match key.code {
+        KeyCode::Up => app.dir_selected_up(),
+        KeyCode::Down => app.dir_selected_down(),
+        KeyCode::Enter => start_scan(app, scan_tx),
+        _ => {}
+    }
+}
+
+fn handle_results(
+    app: &mut App,
+    key: crossterm::event::KeyEvent,
+    _scan_tx: &mpsc::Sender<ScanMessage>,
+) {
+    match key.code {
+        KeyCode::Up => app.selected_up(),
+        KeyCode::Down => app.selected_down(),
+        KeyCode::Enter => open_selected_file(app),
+        _ => {}
+    }
+}
+
+fn handle_command_input(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Esc => app.exit_command_mode(),
+        KeyCode::Enter => command::execute(app),
+        KeyCode::Backspace => app.delete_command_char(),
+        KeyCode::Left => app.move_command_cursor_left(),
+        KeyCode::Right => app.move_command_cursor_right(),
+        KeyCode::Char(c) => app.insert_command_char(c),
+        _ => {}
+    }
+}
+
+fn open_selected_file(app: &mut App) {
+    let filtered = app.filtered_results();
+    if let Some(result) = filtered.get(app.selected) {
+        let path = result.path.to_string_lossy().to_string();
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open").arg(&path).spawn();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("cmd")
+                .args(["/c", "start", "", &path])
+                .spawn();
+        }
+        app.message = format!("Opened: {}", path);
+    }
+}
+
+// ==================== 扫描逻辑 ====================
+
+fn start_scan(app: &mut App, tx: &mpsc::Sender<ScanMessage>) {
+    if app.query.is_empty() {
+        app.message = "No query set. Type keyword or use :query <text>.".to_string();
+        return;
+    }
+
+    let enabled_exts = app.enabled_extensions();
+    if enabled_exts.is_empty() {
+        app.message = "Enable at least one file type (←→ Space in Types).".to_string();
+        return;
+    }
+
+    let dirs: Vec<String> = app
+        .dirs
+        .iter()
+        .filter(|d| !d.trim().is_empty())
+        .map(|d| d.trim().to_string())
+        .collect();
+    if dirs.is_empty() {
+        app.message = "No directories set. Use :dir add <path>.".to_string();
+        return;
+    }
+
+    let threads = app.threads;
+    let keyword = app.query.clone();
+
+    app.results.clear();
+    app.scanning = true;
+    app.scanned_files = 0;
+    app.total_files = 0;
+    app.selected = 0;
+    app.message = format!(
+        "Scanning '{}' in [{}] with {} threads...",
+        keyword,
+        dirs.join(", "),
+        threads
+    );
+
+    let tx = tx.clone();
+    let enabled_exts = enabled_exts;
+    let keyword_clone = keyword.clone();
+
+    std::thread::spawn(move || {
+        let utf16_pattern = scan::to_utf16le_bytes(&keyword_clone);
+        let utf8_pattern = keyword_clone.as_bytes();
+
+        let files: Vec<_> = dirs
+            .iter()
+            .flat_map(|d| {
+                WalkDir::new(d)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
+                        let path = e.path();
+                        if !path.is_file() {
+                            return false;
+                        }
+                        path.extension().map_or(false, |ext| {
+                            let ext = ext.to_str().unwrap_or("").to_lowercase();
+                            enabled_exts.contains(&ext)
+                        })
+                    })
+            })
+            .collect();
+
+        let total = files.len();
+        let _ = tx.send(ScanMessage::Progress { scanned: 0, total });
+
+        let pool = match ThreadPoolBuilder::new().num_threads(threads).build() {
+            Ok(p) => p,
+            Err(_e) => {
+                let _ = tx.send(ScanMessage::Progress {
+                    scanned: 0,
+                    total: 0,
+                });
+                let _ = tx.send(ScanMessage::Done { dirs, total: 0 });
+                return;
+            }
+        };
+
+        let scanned = AtomicUsize::new(0);
+
+        pool.install(|| {
+            files.par_iter().for_each(|entry| {
+                let path = entry.path();
+                let path_str = path.to_string_lossy();
+                let ext = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+
+                let hit = match ext.as_str() {
+                    "docx" => scan::search_docx(&path_str, &keyword_clone).unwrap_or(false),
+                    "doc" | "wps" => {
+                        scan::search_doc(&path_str, &utf16_pattern, utf8_pattern).unwrap_or(false)
+                    }
+                    "xlsx" | "xls" | "et" => {
+                        scan::search_excel(&path_str, &keyword_clone).unwrap_or(false)
+                    }
+                    "pdf" => scan::search_pdf(&path_str, &keyword_clone).unwrap_or(false),
+                    _ => false,
+                };
+
+                if hit {
+                    let file_type = FileType::from_ext(ext.as_str()).unwrap_or(FileType::Word);
+                    let _ = tx.send(ScanMessage::Hit(ScanResult {
+                        path: path.to_path_buf(),
+                        file_type,
+                    }));
+                }
+
+                let n = scanned.fetch_add(1, Ordering::Relaxed) + 1;
+                if n % 10 == 0 || n == total {
+                    let _ = tx.send(ScanMessage::Progress { scanned: n, total });
+                }
+            });
+        });
+
+        let _ = tx.send(ScanMessage::Done { dirs, total });
+    });
 }
