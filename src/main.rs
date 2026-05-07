@@ -156,8 +156,11 @@ fn handle_normal_input(
     // Global keys
     match key.code {
         KeyCode::Char('q') => {
-            app.should_quit = true;
-            return;
+            // Don't quit when typing 'q' in the keyword field
+            if !(app.focus == Focus::ConfigLeft && app.config_left_row == 0) {
+                app.should_quit = true;
+                return;
+            }
         }
         KeyCode::Char(':') => {
             app.enter_command_mode();
