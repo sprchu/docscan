@@ -10,7 +10,7 @@ pub fn execute(app: &mut App) {
 
     let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
     let action = parts[0];
-    let arg = parts.get(1).unwrap_or(&"").trim();
+    let arg = parts.get(1).copied().unwrap_or("").trim();
 
     match action {
         "q" | "quit" => {
@@ -47,37 +47,57 @@ pub fn execute(app: &mut App) {
         "dir" => {
             let sub_parts: Vec<&str> = arg.splitn(2, ' ').collect();
             let sub = sub_parts[0];
-            let sub_arg = sub_parts.get(1).unwrap_or(&"").trim();
+            let sub_arg = sub_parts.get(1).copied().unwrap_or("").trim();
 
             match sub {
                 "add" | "a" => {
                     if sub_arg.is_empty() {
                         app.message = "Usage: :dir add <path>".to_string();
                     } else {
-                        app.dirs.push(sub_arg.to_string());
+                        // Insert before the empty slot
+                        let empty_idx = app.dirs.len().saturating_sub(1);
+                        app.dirs.insert(empty_idx, sub_arg.to_string());
+                        app.ensure_empty_slot();
                         app.message = format!("Added directory: {}", sub_arg);
                     }
                 }
                 "rm" | "remove" | "r" => {
-                    if app.dirs.is_empty() {
+                    let active: Vec<usize> = app
+                        .dirs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, d)| !d.trim().is_empty())
+                        .map(|(i, _)| i)
+                        .collect();
+                    if active.is_empty() {
                         app.message = "No directories to remove.".to_string();
                     } else {
-                        let index = sub_arg.parse::<usize>().unwrap_or(1);
-                        let removed = app.dirs.remove(index - 1);
+                        let index: usize = sub_arg.parse().unwrap_or(1);
+                        let pos = index.saturating_sub(1).min(active.len().saturating_sub(1));
+                        let real_idx = active[pos];
+                        let removed = app.dirs.remove(real_idx);
+                        app.ensure_empty_slot();
                         app.message = format!("Removed: {}", removed);
                     }
                 }
                 "clear" | "c" => {
-                    let count = app.dirs.len();
+                    let count = app.active_dirs().len();
                     app.dirs.clear();
+                    app.dirs.push(String::new());
+                    app.dir_selected = 0;
                     app.message = format!(
                         "Cleared {} director{}.",
                         count,
                         if count == 1 { "y" } else { "ies" }
                     );
                 }
+                "browse" | "b" => {
+                    app.enter_browse_mode();
+                    return;
+                }
                 _ => {
-                    app.message = "Usage: :dir add <path> | :dir rm | :dir clear".to_string();
+                    app.message = "Usage: :dir add <path> | :dir rm [n] | :dir clear | :dir browse"
+                        .to_string();
                 }
             }
         }

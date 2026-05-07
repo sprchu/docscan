@@ -125,6 +125,7 @@ where
                     Mode::Help => {
                         app.mode = Mode::Normal;
                     }
+                    Mode::Browse => handle_browse_input(app, key.code),
                     Mode::Normal => handle_normal_input(app, key, &scan_tx),
                 }
             }
@@ -144,6 +145,9 @@ enum ScanMessage {
 // ↑/↓         = ConfigLeft: 选择参数行 / ConfigRight: 浏览路径 / Results: 浏览结果
 // ←/→         = ConfigLeft: 调整参数 / ConfigRight: —
 // Space       = ConfigLeft+Types: 切换文件类型
+// e           = ConfigRight: 路径选择器编辑
+// d           = ConfigRight: 删除所选路径
+// a           = ConfigRight: 路径选择器新增
 // Enter       = ConfigLeft/ConfigRight: 开始扫描 / Results: 打开文件
 // :           = 命令模式
 // q           = 退出
@@ -244,6 +248,14 @@ fn handle_config_right(
     match key.code {
         KeyCode::Up => app.dir_selected_up(),
         KeyCode::Down => app.dir_selected_down(),
+        KeyCode::Char('e') => {
+            let idx = app.dir_selected;
+            app.enter_browse_mode_for_index(idx);
+        }
+        KeyCode::Char('d') => app.delete_selected_path(),
+        KeyCode::Char('a') => {
+            app.enter_browse_mode();
+        }
         KeyCode::Enter => start_scan(app, scan_tx),
         _ => {}
     }
@@ -419,4 +431,54 @@ fn start_scan(app: &mut App, tx: &mpsc::Sender<ScanMessage>) {
 
         let _ = tx.send(ScanMessage::Done { dirs, total });
     });
+}
+
+// ==================== Browse input ====================
+
+fn handle_browse_input(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Esc => app.exit_browse_mode(),
+        KeyCode::Up | KeyCode::Char('k') => app.browse_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.browse_down(),
+        KeyCode::Enter => app.browse_enter(),
+        KeyCode::Backspace | KeyCode::Left => app.browse_parent(),
+        KeyCode::Char(' ') => app.select_browse_dir(),
+        KeyCode::Char('~') => {
+            if let Some(home) = dirs_fallback::home_dir() {
+                app.browse_cwd = home;
+                app.browse_entries = App::list_dir_entries(&app.browse_cwd);
+                app.browse_selected = 0;
+            }
+        }
+        KeyCode::Char('/') => {
+            // Go to root (or C:\ on Windows)
+            #[cfg(target_os = "windows")]
+            {
+                app.browse_cwd = std::path::PathBuf::from("C:\\");
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                app.browse_cwd = std::path::PathBuf::from("/");
+            }
+            app.browse_entries = App::list_dir_entries(&app.browse_cwd);
+            app.browse_selected = 0;
+        }
+        _ => {}
+    }
+}
+
+/// Fallback home directory for platforms without dirs crate
+mod dirs_fallback {
+    pub fn home_dir() -> Option<std::path::PathBuf> {
+        #[cfg(target_os = "windows")]
+        {
+            std::env::var("USERPROFILE")
+                .ok()
+                .map(std::path::PathBuf::from)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            std::env::var("HOME").ok().map(std::path::PathBuf::from)
+        }
+    }
 }

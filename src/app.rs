@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -62,6 +63,7 @@ pub enum Mode {
     Normal,
     Command,
     Help,
+    Browse,
 }
 
 pub struct App {
@@ -82,9 +84,9 @@ pub struct App {
     // Interaction state
     pub focus: Focus,
     pub mode: Mode,
-    pub config_left_row: usize, // 0=Keyword, 1=Threads, 2=FileTypes
-    pub selected: usize,        // selected index in filtered results
-    pub dir_selected: usize,    // selected index in dirs list
+    pub config_left_row: usize,
+    pub selected: usize,
+    pub dir_selected: usize,
     pub command: String,
     pub command_cursor: usize,
     pub message: String,
@@ -92,19 +94,37 @@ pub struct App {
     // Filter
     pub filter: Option<FileType>,
 
+    // Browse state
+    pub browse_cwd: PathBuf,
+    pub browse_entries: Vec<BrowseEntry>,
+    pub browse_selected: usize,
+    /// If Some(idx), browse picker edits dirs[idx]; None = add new
+    pub browse_target_index: Option<usize>,
+
     pub should_quit: bool,
     pub auto_scan: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct BrowseEntry {
+    pub name: String,
+    pub is_dir: bool,
 }
 
 impl App {
     pub fn new(query: String, threads: usize, dirs: Vec<String>, pdf: bool) -> Self {
         let query_cursor = query.len();
         let auto_scan = !query.is_empty() && !dirs.is_empty();
-        let dirs = if dirs.is_empty() {
+        let mut dirs = if dirs.is_empty() {
             vec![".".to_string()]
         } else {
             dirs
         };
+        if dirs.last().map_or(true, |d| !d.is_empty()) {
+            dirs.push(String::new());
+        }
+        let browse_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let browse_entries = Self::list_dir_entries(&browse_cwd);
         App {
             query,
             query_cursor,
@@ -128,77 +148,172 @@ impl App {
             command: String::new(),
             command_cursor: 0,
             message: String::from(
-                "Tab: switch panel | ↑↓: navigate | ←→: adjust | Enter: scan | :help | q: quit",
+                "Tab: switch | ↑↓: nav | ←→: adjust | e:pick d:del | Enter: scan | q: quit",
             ),
             filter: None,
             should_quit: false,
             auto_scan,
+            browse_cwd,
+            browse_entries,
+            browse_selected: 0,
+            browse_target_index: None,
         }
     }
 
-    pub fn filtered_results(&self) -> Vec<&ScanResult> {
-        if let Some(ref ft) = self.filter {
-            self.results.iter().filter(|r| r.file_type == *ft).collect()
+    // ── Active dirs (excluding the trailing empty slot) ──
+
+    pub fn active_dirs(&self) -> Vec<&str> {
+        self.dirs
+            .iter()
+            .filter(|d| !d.trim().is_empty())
+            .map(|d| d.as_str())
+            .collect()
+    }
+
+    pub fn ensure_empty_slot(&mut self) {
+        while self.dirs.last().map_or(false, |d| d.trim().is_empty()) {
+            self.dirs.pop();
+        }
+        self.dirs.push(String::new());
+        if self.dir_selected >= self.dirs.len() {
+            self.dir_selected = self.dirs.len().saturating_sub(1);
+        }
+    }
+
+    /// Delete the selected path (not the empty slot)
+    pub fn delete_selected_path(&mut self) {
+        let idx = self.dir_selected;
+        if idx >= self.dirs.len() || self.dirs[idx].trim().is_empty() {
+            return;
+        }
+        let removed = self.dirs.remove(idx);
+        if self.dir_selected >= self.dirs.len() {
+            self.dir_selected = self.dirs.len().saturating_sub(1);
+        }
+        self.ensure_empty_slot();
+        self.message = format!("Removed: {}", removed);
+    }
+
+    // ── Browse mode ──
+
+    pub fn enter_browse_mode(&mut self) {
+        self.browse_target_index = None;
+        self.browse_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        self._enter_browse();
+    }
+
+    pub fn enter_browse_mode_for_index(&mut self, idx: usize) {
+        self.browse_target_index = Some(idx);
+        // Seed cwd from existing path if valid
+        let seed = PathBuf::from(&self.dirs[idx]);
+        if seed.is_dir() {
+            self.browse_cwd = seed;
         } else {
-            self.results.iter().collect()
+            self.browse_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        }
+        self._enter_browse();
+    }
+
+    fn _enter_browse(&mut self) {
+        self.mode = Mode::Browse;
+        self.command.clear();
+        self.command_cursor = 0;
+        self.browse_entries = Self::list_dir_entries(&self.browse_cwd);
+        self.browse_selected = 0;
+    }
+
+    pub fn exit_browse_mode(&mut self) {
+        self.mode = Mode::Normal;
+        self.browse_target_index = None;
+    }
+
+    pub fn browse_up(&mut self) {
+        if self.browse_selected > 0 {
+            self.browse_selected -= 1;
+        } else if !self.browse_entries.is_empty() {
+            self.browse_selected = self.browse_entries.len() - 1;
         }
     }
 
-    // ── Config left row navigation ──
-
-    pub fn config_left_row_up(&mut self) {
-        if self.config_left_row > 0 {
-            self.config_left_row -= 1;
+    pub fn browse_down(&mut self) {
+        if !self.browse_entries.is_empty() {
+            if self.browse_selected + 1 < self.browse_entries.len() {
+                self.browse_selected += 1;
+            } else {
+                self.browse_selected = 0;
+            }
         }
     }
 
-    pub fn config_left_row_down(&mut self) {
-        if self.config_left_row < 2 {
-            self.config_left_row += 1;
+    pub fn browse_enter(&mut self) {
+        if self.browse_entries.is_empty() {
+            self.select_browse_dir();
+            return;
+        }
+        let entry = &self.browse_entries[self.browse_selected];
+        if entry.name == ".." {
+            self.browse_parent();
+        } else if entry.is_dir {
+            let new_path = self.browse_cwd.join(&entry.name);
+            self.browse_cwd = new_path;
+            self.browse_entries = Self::list_dir_entries(&self.browse_cwd);
+            self.browse_selected = 0;
         }
     }
 
-    // ── Dir list navigation ──
-
-    pub fn dir_selected_up(&mut self) {
-        if self.dir_selected > 0 {
-            self.dir_selected -= 1;
+    pub fn browse_parent(&mut self) {
+        if let Some(parent) = self.browse_cwd.parent() {
+            self.browse_cwd = parent.to_path_buf();
+            self.browse_entries = Self::list_dir_entries(&self.browse_cwd);
+            self.browse_selected = 0;
         }
     }
 
-    pub fn dir_selected_down(&mut self) {
-        if self.dir_selected + 1 < self.dirs.len() {
-            self.dir_selected += 1;
+    pub fn select_browse_dir(&mut self) {
+        let path = self.browse_cwd.to_string_lossy().to_string();
+
+        if let Some(idx) = self.browse_target_index {
+            // Replace existing entry
+            if idx < self.dirs.len() {
+                self.dirs[idx] = path.clone();
+            }
+            self.ensure_empty_slot();
+            self.message = format!("Path set to: {}", path);
+        } else {
+            if !self.dirs.iter().any(|d| d == &path) {
+                let empty_idx = self.dirs.len().saturating_sub(1);
+                self.dirs.insert(empty_idx, path.clone());
+                self.ensure_empty_slot();
+                self.message = format!("Added directory: {}", path);
+            } else {
+                self.message = format!("Directory already in list: {}", path);
+            }
         }
+
+        self.exit_browse_mode();
     }
 
-    // ── Results navigation ──
-
-    pub fn selected_up(&mut self) {
-        if self.selected > 0 {
-            self.selected -= 1;
+    pub fn list_dir_entries(cwd: &PathBuf) -> Vec<BrowseEntry> {
+        let mut entries: Vec<BrowseEntry> = Vec::new();
+        if cwd.parent().is_some() {
+            entries.push(BrowseEntry {
+                name: "..".to_string(),
+                is_dir: true,
+            });
         }
-    }
-
-    pub fn selected_down(&mut self) {
-        let max = self.filtered_results().len().saturating_sub(1);
-        if self.selected < max {
-            self.selected += 1;
+        if let Ok(read_dir) = fs::read_dir(cwd) {
+            let mut dirs: Vec<BrowseEntry> = Vec::new();
+            for entry in read_dir.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+                if is_dir {
+                    dirs.push(BrowseEntry { name, is_dir });
+                }
+            }
+            dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            entries.extend(dirs);
         }
-    }
-
-    // ── Threads adjustment ──
-
-    pub fn threads_inc(&mut self) {
-        if self.threads < 64 {
-            self.threads += 1;
-        }
-    }
-
-    pub fn threads_dec(&mut self) {
-        if self.threads > 1 {
-            self.threads -= 1;
-        }
+        entries
     }
 
     // ── Query editing ──
@@ -237,7 +352,64 @@ impl App {
         }
     }
 
-    // ── File type interactive toggle ──
+    // ── Other helpers ──
+
+    pub fn filtered_results(&self) -> Vec<&ScanResult> {
+        if let Some(ref ft) = self.filter {
+            self.results.iter().filter(|r| r.file_type == *ft).collect()
+        } else {
+            self.results.iter().collect()
+        }
+    }
+
+    pub fn config_left_row_up(&mut self) {
+        if self.config_left_row > 0 {
+            self.config_left_row -= 1;
+        }
+    }
+
+    pub fn config_left_row_down(&mut self) {
+        if self.config_left_row < 2 {
+            self.config_left_row += 1;
+        }
+    }
+
+    pub fn dir_selected_up(&mut self) {
+        if self.dir_selected > 0 {
+            self.dir_selected -= 1;
+        }
+    }
+
+    pub fn dir_selected_down(&mut self) {
+        if self.dir_selected + 1 < self.dirs.len() {
+            self.dir_selected += 1;
+        }
+    }
+
+    pub fn selected_up(&mut self) {
+        if self.selected > 0 {
+            self.selected -= 1;
+        }
+    }
+
+    pub fn selected_down(&mut self) {
+        let max = self.filtered_results().len().saturating_sub(1);
+        if self.selected < max {
+            self.selected += 1;
+        }
+    }
+
+    pub fn threads_inc(&mut self) {
+        if self.threads < 64 {
+            self.threads += 1;
+        }
+    }
+
+    pub fn threads_dec(&mut self) {
+        if self.threads > 1 {
+            self.threads -= 1;
+        }
+    }
 
     pub fn toggle_file_type(&mut self, idx: usize) {
         if idx < self.file_types.len() {
@@ -264,8 +436,6 @@ impl App {
             .flat_map(|(ft, _)| ft.extensions().iter().map(|s| s.to_string()))
             .collect()
     }
-
-    // ── Command mode ──
 
     pub fn enter_command_mode(&mut self) {
         self.mode = Mode::Command;

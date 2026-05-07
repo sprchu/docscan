@@ -29,6 +29,9 @@ pub fn render(f: &mut Frame, app: &App) {
     if app.mode == Mode::Help {
         render_help_popup(f, area);
     }
+    if app.mode == Mode::Browse {
+        render_browse_popup(f, app, area);
+    }
 }
 
 // ==================== Config panel ====================
@@ -52,7 +55,7 @@ fn render_config_panel(f: &mut Frame, app: &App, area: Rect) {
             2 => "←→ select type | Space toggle",
             _ => "",
         },
-        Focus::ConfigRight => "↑↓ browse paths",
+        Focus::ConfigRight => "↑↓ browse | e picker edit | d delete | a picker add | Enter scan",
         Focus::Results => "",
     };
     f.render_widget(
@@ -208,43 +211,42 @@ fn render_paths_panel(f: &mut Frame, app: &App, area: Rect) {
     let is_focused = app.focus == Focus::ConfigRight;
     let border_color = if is_focused { Color::Cyan } else { Color::Gray };
 
+    let active_count = app.active_dirs().len();
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color))
-        .title(format!(" Paths ({}) ", app.dirs.len()))
+        .title(format!(" Paths ({}) ", active_count))
         .title_alignment(Alignment::Left);
 
     let inner = block.inner(area);
     f.render_widget(block, area);
-
-    if app.dirs.is_empty() {
-        f.render_widget(
-            Paragraph::new("No directories.\nUse :dir add <path>")
-                .style(Style::default().fg(Color::DarkGray))
-                .alignment(Alignment::Center),
-            inner,
-        );
-        return;
-    }
 
     let rows: Vec<Row> = app
         .dirs
         .iter()
         .enumerate()
         .map(|(i, d)| {
-            let style = if is_focused && i == app.dir_selected {
+            let is_sel = is_focused && i == app.dir_selected;
+            let is_empty = d.trim().is_empty();
+            let style = if is_sel {
                 Style::default().fg(Color::Black).bg(Color::Cyan)
             } else if i % 2 == 0 {
                 Style::default().bg(Color::Rgb(30, 30, 40))
             } else {
                 Style::default()
             };
-            Row::new(vec![
-                Cell::from(format!("{}", i + 1)),
-                Cell::from(d.to_owned()),
-            ])
-            .style(style)
+            let num = if is_empty {
+                "+".to_string()
+            } else {
+                format!("{}", i + 1)
+            };
+            let path_text = if is_empty {
+                Span::styled("<add new path>", Style::default().fg(Color::DarkGray))
+            } else {
+                Span::raw(d.to_owned())
+            };
+            Row::new(vec![Cell::from(num), Cell::from(path_text)]).style(style)
         })
         .collect();
 
@@ -376,6 +378,7 @@ fn render_command_bar(f: &mut Frame, app: &App, area: Rect) {
                 inner,
             );
         }
+        Mode::Browse => {}
     }
 }
 
@@ -439,12 +442,84 @@ fn render_help_popup(f: &mut Frame, area: Rect) {
             Span::raw("Start scan / open selected file"),
         ]),
         Line::from(vec![
+            Span::styled("  e       ", Style::default().fg(Color::Cyan)),
+            Span::raw("Pick new path for selected entry"),
+        ]),
+        Line::from(vec![
+            Span::styled("  d       ", Style::default().fg(Color::Cyan)),
+            Span::raw("Delete selected path"),
+        ]),
+        Line::from(vec![
+            Span::styled("  a       ", Style::default().fg(Color::Cyan)),
+            Span::raw("Pick new path to add"),
+        ]),
+        Line::from(vec![
             Span::styled("  :       ", Style::default().fg(Color::Cyan)),
             Span::raw("Enter command mode"),
         ]),
         Line::from(vec![
             Span::styled("  q       ", Style::default().fg(Color::Cyan)),
             Span::raw("Quit"),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Path List",
+            Style::default().fg(Color::Cyan).bold(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  ↑↓      ", Style::default().fg(Color::Cyan)),
+            Span::raw("Select path entry"),
+        ]),
+        Line::from(vec![
+            Span::styled("  e       ", Style::default().fg(Color::Cyan)),
+            Span::raw("Open picker to replace selected entry"),
+        ]),
+        Line::from(vec![
+            Span::styled("  d       ", Style::default().fg(Color::Cyan)),
+            Span::raw("Delete selected entry"),
+        ]),
+        Line::from(vec![
+            Span::styled("  a       ", Style::default().fg(Color::Cyan)),
+            Span::raw("Open picker to add new directory"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Enter   ", Style::default().fg(Color::Cyan)),
+            Span::raw("Start scan"),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Directory Browser",
+            Style::default().fg(Color::Cyan).bold(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  ↑↓/jk   ", Style::default().fg(Color::Cyan)),
+            Span::raw("Navigate entries"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Enter   ", Style::default().fg(Color::Cyan)),
+            Span::raw("Open subdirectory / select current"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Space   ", Style::default().fg(Color::Cyan)),
+            Span::raw("Select current directory"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Bksp    ", Style::default().fg(Color::Cyan)),
+            Span::raw("Go to parent directory"),
+        ]),
+        Line::from(vec![
+            Span::styled("  ~       ", Style::default().fg(Color::Cyan)),
+            Span::raw("Jump to home directory"),
+        ]),
+        Line::from(vec![
+            Span::styled("  /       ", Style::default().fg(Color::Cyan)),
+            Span::raw("Jump to root (/ or C:\\)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Esc     ", Style::default().fg(Color::Cyan)),
+            Span::raw("Cancel / close browser"),
         ]),
         Line::from(""),
         Line::from(Span::styled(
@@ -477,6 +552,10 @@ fn render_help_popup(f: &mut Frame, area: Rect) {
             Span::raw("Clear all directories (:c)"),
         ]),
         Line::from(vec![
+            Span::styled("  :dir browse        ", Style::default().fg(Color::Cyan)),
+            Span::raw("Open directory browser (:b)"),
+        ]),
+        Line::from(vec![
             Span::styled("  :filter <type>     ", Style::default().fg(Color::Cyan)),
             Span::raw("Filter: word/excel/pdf/clear (:f)"),
         ]),
@@ -487,4 +566,99 @@ fn render_help_popup(f: &mut Frame, area: Rect) {
     ];
 
     f.render_widget(Paragraph::new(Text::from(keys)), inner);
+}
+
+// ==================== Browse popup ====================
+
+fn render_browse_popup(f: &mut Frame, app: &App, area: Rect) {
+    let popup_area = centered_rect(65, 75, area);
+
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Browse Directory ")
+        .title_alignment(Alignment::Center);
+
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    // Split: header line + list area + footer hint
+    let vchunks = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(0),
+        Constraint::Length(2),
+    ])
+    .split(inner);
+
+    // Header: current path
+    let cwd_display = app.browse_cwd.to_string_lossy().to_string();
+    let header_text = vec![
+        Line::from(Span::styled(
+            "Current:",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            format!("📁 {}", cwd_display),
+            Style::default().fg(Color::Yellow),
+        )),
+    ];
+    f.render_widget(Paragraph::new(Text::from(header_text)), vchunks[0]);
+
+    // Directory listing
+    if app.browse_entries.is_empty() {
+        f.render_widget(
+            Paragraph::new("(empty directory)")
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Center),
+            vchunks[1],
+        );
+    } else {
+        let rows: Vec<Row> = app
+            .browse_entries
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                let is_selected = i == app.browse_selected;
+                let icon = "📁";
+                let style = if is_selected {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else if i % 2 == 0 {
+                    Style::default().bg(Color::Rgb(25, 25, 35))
+                } else {
+                    Style::default()
+                };
+                Row::new(vec![Cell::from(format!("  {} {}", icon, entry.name))]).style(style)
+            })
+            .collect();
+
+        let widths = [Constraint::Fill(1)];
+        let mut table_state = TableState::default().with_selected(Some(app.browse_selected));
+
+        f.render_stateful_widget(
+            Table::new(rows, widths).column_spacing(1),
+            vchunks[1],
+            &mut table_state,
+        );
+    }
+
+    // Footer hints
+    let hints = vec![
+        Span::styled("Enter", Style::default().fg(Color::Cyan).bold()),
+        Span::raw(":open dir  "),
+        Span::styled("Space", Style::default().fg(Color::Cyan).bold()),
+        Span::raw(":select  "),
+        Span::styled("Backspace", Style::default().fg(Color::Cyan).bold()),
+        Span::raw(":parent  "),
+        Span::styled("Esc", Style::default().fg(Color::Cyan).bold()),
+        Span::raw(":cancel  "),
+        Span::styled("~", Style::default().fg(Color::Cyan).bold()),
+        Span::raw(":home"),
+    ];
+    f.render_widget(
+        Paragraph::new(Line::from(hints)).alignment(Alignment::Center),
+        vchunks[2],
+    );
 }
