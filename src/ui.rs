@@ -51,12 +51,16 @@ pub fn render(f: &mut Frame, app: &App) -> UiRects {
     }
 
     // Cursor for filter input (only when filter_focused)
-    if app.mode == Mode::Normal && app.focus == Focus::Results && app.filter_focused {
+    if app.mode == Mode::Normal
+        && app.focus == Focus::Results
+        && app.filter_focused
+        && !app.filter_text.is_empty()
+    {
         if let Some(ref r) = rects.filter_input {
-            let prefix = UnicodeWidthStr::width(
-                &app.filter_text[..app.filter_text_cursor.min(app.filter_text.len())],
-            ) as u16;
-            f.set_cursor_position((r.x + prefix, r.y));
+            let vis_w = r.width.saturating_sub(1) as usize;
+            let (_, cursor_offset) =
+                scroll_text_to_cursor(&app.filter_text, app.filter_text_cursor, vis_w);
+            f.set_cursor_position((r.x + cursor_offset, r.y));
         }
     }
 
@@ -144,14 +148,28 @@ fn render_keyword_row(
     );
 
     let btn_w = 8u16;
-    let input_w = w.saturating_sub(LABEL_W + btn_w + 2);
+    let gap = 1u16;
+    let input_w = w.saturating_sub(LABEL_W + btn_w + gap);
 
-    // Input field
+    // Guard: minimum usable input width
+    if input_w < 4 {
+        return; // too narrow to render anything useful
+    }
+
     let value = &app.query;
-    let display = if value.is_empty() {
+
+    // ── Scroll input text so cursor stays visible ──
+    let (visible_text, cursor_offset) = if value.is_empty() {
+        (String::new(), 0u16)
+    } else {
+        let vis_w = input_w.saturating_sub(1) as usize; // reserve 1 cell for cursor
+        scroll_text_to_cursor(value, app.query_cursor, vis_w)
+    };
+
+    let display = if visible_text.is_empty() {
         Span::styled("(type keyword)", Style::default().fg(theme::FG_MUTED))
     } else {
-        Span::styled(value, Style::default().fg(theme::FG))
+        Span::styled(&visible_text, Style::default().fg(theme::FG))
     };
     let input_rect = Rect::new(x + LABEL_W, y, input_w, 1);
     f.render_widget(
@@ -160,15 +178,14 @@ fn render_keyword_row(
     );
     rects.keyword_input = Some(input_rect);
 
-    if sel {
-        let prefix = UnicodeWidthStr::width(&value[..app.query_cursor.min(value.len())]) as u16;
-        f.set_cursor_position((x + LABEL_W + prefix, y));
+    if sel && !value.is_empty() {
+        f.set_cursor_position((x + LABEL_W + cursor_offset, y));
     }
 
     // Scan button
-    let btn_x = x + LABEL_W + input_w + 1;
+    let btn_x = x + LABEL_W + input_w + gap;
     let btn_rect = Rect::new(btn_x, y, btn_w, 1);
-    let btn_style = if is_focused && app.config_left_row == 0 {
+    let btn_style = if sel {
         Style::default()
             .fg(theme::SELECTED_FG)
             .bg(theme::ACCENT)
@@ -249,13 +266,18 @@ fn render_threads_row(
 fn render_types_row(
     f: &mut Frame,
     app: &App,
-    _is_focused: bool,
+    is_focused: bool,
     x: u16,
     y: u16,
-    _w: u16,
+    w: u16,
     rects: &mut UiRects,
 ) {
-    let label_style = Style::default().fg(theme::FG_DIM);
+    let sel = is_focused && app.config_left_row == 2;
+    let label_style = if sel {
+        Style::default().fg(theme::ACCENT).bold()
+    } else {
+        Style::default().fg(theme::FG_DIM)
+    };
 
     f.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
@@ -266,15 +288,33 @@ fn render_types_row(
     );
 
     rects.type_btns.clear();
+    let right_edge = x + w;
     let mut cx = x + LABEL_W;
 
-    for (_i, (ft, enabled)) in app.file_types.iter().enumerate() {
+    for (i, (ft, enabled)) in app.file_types.iter().enumerate() {
         let label = ft.short_label();
         let marker = if *enabled { "●" } else { "○" };
-        let text = format!(" {} {}", marker, label);
-        let text_w = text.len() as u16 + 2;
+        let text = format!("{} {}", marker, label);
+        let text_w = text.len() as u16;
 
-        let btn_style = if *enabled {
+        // Clip: stop drawing if the button would overflow the panel
+        if cx + text_w > right_edge && cx > x + LABEL_W {
+            // Show overflow indicator
+            let indicator = "…";
+            f.render_widget(
+                Paragraph::new(Line::from(vec![Span::styled(
+                    indicator,
+                    Style::default().fg(theme::FG_MUTED),
+                )])),
+                Rect::new(cx, y, 1, 1),
+            );
+            break;
+        }
+
+        let is_cursor = is_focused && i == app.ft_cursor;
+        let btn_style = if is_cursor && sel {
+            Style::default().fg(theme::ACCENT).bold()
+        } else if *enabled {
             Style::default().fg(theme::SUCCESS)
         } else {
             Style::default().fg(theme::FG_MUTED)
@@ -286,7 +326,7 @@ fn render_types_row(
             btn_rect,
         );
         rects.type_btns.push(btn_rect);
-        cx += text_w + 1;
+        cx += text_w;
     }
 }
 
@@ -450,32 +490,101 @@ fn render_results_panel(f: &mut Frame, app: &App, area: Rect, rects: &mut UiRect
     let bar_h = 1u16;
     let bar_y = inner.y;
     let bar_w = inner.width;
+    let bar_right = inner.x + bar_w;
 
-    let input_w = (bar_w as f32 * 0.35) as u16;
-    let btn_gap = 1u16;
-    let all_btn_w = 5u16;
-    let clear_btn_w = 7u16;
+    // Fixed right-side buttons (laid out right-to-left)
     let quit_btn_w = 8u16;
+    let clear_btn_w = 7u16;
+    let all_btn_w = 5u16;
+    let btn_gap = 1u16;
 
-    // Filter input
+    // Quit button — far right
+    let quit_x = bar_right.saturating_sub(quit_btn_w);
+    let quit_rect = Rect::new(quit_x, bar_y, quit_btn_w, 1);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            " ✕ Quit ",
+            Style::default().fg(theme::FG).bg(theme::DANGER),
+        )])),
+        quit_rect,
+    );
+    rects.quit_button = Some(quit_rect);
+
+    // Clear button — left of quit
+    let clear_x = quit_x.saturating_sub(clear_btn_w + btn_gap);
+    let clear_visible = clear_x > inner.x + 20; // only show if enough room
+    if clear_visible {
+        let r = Rect::new(clear_x, bar_y, clear_btn_w, 1);
+        f.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(
+                " Clear ",
+                Style::default().fg(theme::FG).bg(theme::BUTTON_BG),
+            )])),
+            r,
+        );
+        rects.filter_clear_btn = Some(r);
+    } else {
+        rects.filter_clear_btn = None;
+    }
+
+    // All button — left of clear
+    let all_anchor = if clear_visible { clear_x } else { quit_x };
+    let all_x = all_anchor.saturating_sub(all_btn_w + btn_gap);
+    let all_visible = all_x > inner.x + 20;
+    if all_visible {
+        let r = Rect::new(all_x, bar_y, all_btn_w, 1);
+        let all_active = app.filter.is_none();
+        let all_style = if all_active {
+            Style::default()
+                .fg(theme::SELECTED_FG)
+                .bg(theme::ACCENT)
+                .bold()
+        } else {
+            Style::default().fg(theme::FG).bg(theme::BUTTON_BG)
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(" All ", all_style)])),
+            r,
+        );
+        rects.filter_all_btn = Some(r);
+    } else {
+        rects.filter_all_btn = None;
+    }
+
+    // Remaining space available for filter input + type buttons
+    let reserved_right = if all_visible {
+        all_x
+    } else if clear_visible {
+        clear_x
+    } else {
+        quit_x
+    };
+    let available = reserved_right.saturating_sub(inner.x);
+
+    // Filter input: take ~40% of available space, but at least 10 cols
+    let input_w = ((available as f32 * 0.40) as u16).clamp(10, available.saturating_sub(4));
     let input_rect = Rect::new(inner.x, bar_y, input_w, 1);
     let input_bg = if app.filter_focused {
         Style::default().bg(theme::BUTTON_BG)
     } else {
         Style::default()
     };
-    let placeholder = if app.filter_text.is_empty() {
+
+    // Scroll filter text to keep cursor visible
+    let filter_display = if app.filter_text.is_empty() {
         Span::styled("Filter path...", Style::default().fg(theme::FG_MUTED))
     } else {
-        Span::styled(&app.filter_text, Style::default().fg(theme::FG))
+        let vis_w = input_w.saturating_sub(1) as usize;
+        let (visible, _) = scroll_text_to_cursor(&app.filter_text, app.filter_text_cursor, vis_w);
+        Span::styled(visible, Style::default().fg(theme::FG))
     };
     f.render_widget(
-        Paragraph::new(Line::from(vec![placeholder])).style(input_bg),
+        Paragraph::new(Line::from(vec![filter_display])).style(input_bg),
         input_rect,
     );
     rects.filter_input = Some(input_rect);
 
-    // File type filter buttons
+    // File type filter buttons (left of reserved area, right of input)
     rects.filter_type_btns.clear();
     let mut bx = inner.x + input_w + 2;
 
@@ -497,6 +606,12 @@ fn render_results_panel(f: &mut Frame, app: &App, area: Rect, rects: &mut UiRect
         };
         let btext = format!(" {} ", label);
         let bw = btext.len() as u16;
+
+        // Stop if this button would overflow into reserved right area
+        if bx + bw > reserved_right.saturating_sub(1) {
+            break;
+        }
+
         let btn_rect = Rect::new(bx, bar_y, bw, 1);
         f.render_widget(
             Paragraph::new(Line::from(vec![Span::styled(&btext, bstyle)])),
@@ -505,47 +620,6 @@ fn render_results_panel(f: &mut Frame, app: &App, area: Rect, rects: &mut UiRect
         rects.filter_type_btns.push((ft.clone(), btn_rect));
         bx += bw + btn_gap;
     }
-
-    // All button
-    let all_rect = Rect::new(bx, bar_y, all_btn_w, 1);
-    let all_active = app.filter.is_none();
-    let all_style = if all_active {
-        Style::default()
-            .fg(theme::SELECTED_FG)
-            .bg(theme::ACCENT)
-            .bold()
-    } else {
-        Style::default().fg(theme::FG).bg(theme::BUTTON_BG)
-    };
-    f.render_widget(
-        Paragraph::new(Line::from(vec![Span::styled(" All ", all_style)])),
-        all_rect,
-    );
-    rects.filter_all_btn = Some(all_rect);
-    bx += all_btn_w + btn_gap;
-
-    // Clear filter text button
-    let clear_rect = Rect::new(bx, bar_y, clear_btn_w, 1);
-    f.render_widget(
-        Paragraph::new(Line::from(vec![Span::styled(
-            " Clear ",
-            Style::default().fg(theme::FG).bg(theme::BUTTON_BG),
-        )])),
-        clear_rect,
-    );
-    rects.filter_clear_btn = Some(clear_rect);
-
-    // Quit button — far right
-    let quit_x = inner.x + bar_w.saturating_sub(quit_btn_w);
-    let quit_rect = Rect::new(quit_x, bar_y, quit_btn_w, 1);
-    f.render_widget(
-        Paragraph::new(Line::from(vec![Span::styled(
-            " ✕ Quit ",
-            Style::default().fg(theme::FG).bg(theme::DANGER),
-        )])),
-        quit_rect,
-    );
-    rects.quit_button = Some(quit_rect);
 
     // ── Results list ──
     let list_y = bar_y + bar_h + 1;
@@ -651,10 +725,20 @@ fn render_results_panel(f: &mut Frame, app: &App, area: Rect, rects: &mut UiRect
 // ==================== Status bar ====================
 
 fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
-    let text = match app.mode {
+    let raw = match app.mode {
         Mode::Command => format!(":{}", app.command),
         Mode::Normal => app.message.clone(),
         Mode::Browse => "Browsing directory...".to_string(),
+    };
+    // Clip to fit within the status bar area (using char count for safety)
+    let max_w = area.width as usize;
+    let text: String = if raw.chars().count() > max_w && max_w > 3 {
+        raw.chars()
+            .take(max_w.saturating_sub(1))
+            .chain(['…'])
+            .collect()
+    } else {
+        raw
     };
     f.render_widget(
         Paragraph::new(Span::styled(text, Style::default().fg(theme::FG_DIM))),
@@ -825,6 +909,53 @@ fn render_browse_popup(f: &mut Frame, app: &App, area: Rect, rects: &mut UiRects
 
     rects.browse_confirm_btn = Some(confirm_rect);
     rects.browse_cancel_btn = Some(cancel_rect);
+}
+
+// ── Text scrolling helper ──
+
+/// Given `text` and a byte cursor position, returns a substring that fits
+/// within `vis_width` display columns, keeping the cursor in view, plus the
+/// visual column offset where the cursor should be placed.
+fn scroll_text_to_cursor(text: &str, cursor_byte: usize, vis_width: usize) -> (String, u16) {
+    let cursor_byte = cursor_byte.min(text.len());
+    let text_before_cursor = &text[..cursor_byte];
+    let cursor_col = UnicodeWidthStr::width(text_before_cursor) as u16;
+    let text_width = UnicodeWidthStr::width(text) as u16;
+
+    // If everything fits, no scrolling needed
+    if text_width <= vis_width as u16 {
+        return (text.to_string(), cursor_col);
+    }
+
+    // We need to scroll. Determine the visible window.
+    // Make the cursor column be somewhere in the right half of the visible area.
+    let target_col = (vis_width as u16 * 3 / 4).min(cursor_col);
+    let scroll_start_col = cursor_col.saturating_sub(target_col);
+
+    // Find byte offset corresponding to scroll_start_col display columns
+    let scroll_byte = byte_at_display_col(text, scroll_start_col as usize);
+    // End: one past the last visible column
+    let end_col = (scroll_start_col as usize + vis_width).min(text_width as usize);
+    let end_byte = byte_at_display_col(text, end_col);
+
+    let visible = text[scroll_byte..end_byte].to_string();
+    let cursor_offset = cursor_col.saturating_sub(scroll_start_col);
+
+    (visible, cursor_offset)
+}
+
+/// Find the byte offset in `text` that corresponds to `target_col` display columns.
+fn byte_at_display_col(text: &str, target_col: usize) -> usize {
+    let mut col = 0usize;
+    for (i, c) in text.char_indices() {
+        let s = &text[i..i + c.len_utf8()];
+        let cw = UnicodeWidthStr::width(s);
+        if col + cw > target_col {
+            return i;
+        }
+        col += cw;
+    }
+    text.len()
 }
 
 // ── Scrollbar ──
