@@ -1,5 +1,8 @@
 use std::fs;
 use std::path::PathBuf;
+use std::time::Instant;
+
+use ratatui::layout::Rect;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum FileType {
@@ -62,8 +65,41 @@ impl Focus {
 pub enum Mode {
     Normal,
     Command,
-    Help,
     Browse,
+}
+
+// ── Clickable regions populated during render ──
+
+#[derive(Default, Clone)]
+pub struct UiRects {
+    // Params panel
+    pub keyword_input: Option<Rect>,
+    pub scan_button: Option<Rect>,
+    pub threads_dec_btn: Option<Rect>,
+    pub threads_inc_btn: Option<Rect>,
+    pub type_btns: Vec<Rect>,
+    // Paths panel
+    pub paths_panel: Option<Rect>,
+    pub path_add_btn: Option<Rect>,
+    pub path_edit_btn: Option<Rect>,
+    pub path_del_btn: Option<Rect>,
+    pub path_rows: Vec<Rect>,
+    pub path_list_start: usize,
+    // Results panel
+    pub results_panel: Option<Rect>,
+    pub result_rows: Vec<Rect>,
+    pub result_list_start: usize,
+    pub filter_input: Option<Rect>,
+    pub filter_type_btns: Vec<(FileType, Rect)>,
+    pub filter_all_btn: Option<Rect>,
+    pub filter_clear_btn: Option<Rect>,
+    pub quit_button: Option<Rect>,
+    // Browse popup
+    pub browse_panel: Option<Rect>,
+    pub browse_confirm_btn: Option<Rect>,
+    pub browse_cancel_btn: Option<Rect>,
+    pub browse_rows: Vec<Rect>,
+    pub browse_list_start: usize,
 }
 
 pub struct App {
@@ -93,16 +129,21 @@ pub struct App {
 
     // Filter
     pub filter: Option<FileType>,
+    pub filter_text: String,
+    pub filter_text_cursor: usize,
+    /// When Focus::Results, true = typing in filter, false = navigating list
+    pub filter_focused: bool,
 
     // Browse state
     pub browse_cwd: PathBuf,
     pub browse_entries: Vec<BrowseEntry>,
     pub browse_selected: usize,
-    /// If Some(idx), browse picker edits dirs[idx]; None = add new
+    pub browse_scroll: usize,
     pub browse_target_index: Option<usize>,
+    /// (entry_index, click_time) for double-click detection in browse popup
+    pub last_browse_click: Option<(usize, Instant)>,
 
     pub should_quit: bool,
-    pub auto_scan: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -114,15 +155,11 @@ pub struct BrowseEntry {
 impl App {
     pub fn new(query: String, threads: usize, dirs: Vec<String>, pdf: bool) -> Self {
         let query_cursor = query.len();
-        let auto_scan = !query.is_empty() && !dirs.is_empty();
-        let mut dirs = if dirs.is_empty() {
+        let dirs = if dirs.is_empty() {
             vec![".".to_string()]
         } else {
-            dirs
+            dirs.into_iter().filter(|d| !d.trim().is_empty()).collect()
         };
-        if dirs.last().map_or(true, |d| !d.is_empty()) {
-            dirs.push(String::new());
-        }
         let browse_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let browse_entries = Self::list_dir_entries(&browse_cwd);
         App {
@@ -147,20 +184,22 @@ impl App {
             dir_selected: 0,
             command: String::new(),
             command_cursor: 0,
-            message: String::from(
-                "Tab: switch | ↑↓: nav | ←→: adjust | e:pick d:del | Enter: scan | q: quit",
-            ),
+            message: String::from("Ready. Type a keyword, set directories, then click [Scan]."),
             filter: None,
+            filter_text: String::new(),
+            filter_text_cursor: 0,
+            filter_focused: false,
             should_quit: false,
-            auto_scan,
             browse_cwd,
             browse_entries,
             browse_selected: 0,
+            browse_scroll: 0,
             browse_target_index: None,
+            last_browse_click: None,
         }
     }
 
-    // ── Active dirs (excluding the trailing empty slot) ──
+    // ── Active dirs ──
 
     pub fn active_dirs(&self) -> Vec<&str> {
         self.dirs
@@ -170,17 +209,7 @@ impl App {
             .collect()
     }
 
-    pub fn ensure_empty_slot(&mut self) {
-        while self.dirs.last().map_or(false, |d| d.trim().is_empty()) {
-            self.dirs.pop();
-        }
-        self.dirs.push(String::new());
-        if self.dir_selected >= self.dirs.len() {
-            self.dir_selected = self.dirs.len().saturating_sub(1);
-        }
-    }
-
-    /// Delete the selected path (not the empty slot)
+    /// Delete the selected path
     pub fn delete_selected_path(&mut self) {
         let idx = self.dir_selected;
         if idx >= self.dirs.len() || self.dirs[idx].trim().is_empty() {
@@ -190,7 +219,6 @@ impl App {
         if self.dir_selected >= self.dirs.len() {
             self.dir_selected = self.dirs.len().saturating_sub(1);
         }
-        self.ensure_empty_slot();
         self.message = format!("Removed: {}", removed);
     }
 
@@ -204,7 +232,6 @@ impl App {
 
     pub fn enter_browse_mode_for_index(&mut self, idx: usize) {
         self.browse_target_index = Some(idx);
-        // Seed cwd from existing path if valid
         let seed = PathBuf::from(&self.dirs[idx]);
         if seed.is_dir() {
             self.browse_cwd = seed;
@@ -218,8 +245,14 @@ impl App {
         self.mode = Mode::Browse;
         self.command.clear();
         self.command_cursor = 0;
+        // Canonicalize to resolve "." and symlinks so parent navigation works
+        if let Ok(canon) = self.browse_cwd.canonicalize() {
+            self.browse_cwd = canon;
+        }
         self.browse_entries = Self::list_dir_entries(&self.browse_cwd);
         self.browse_selected = 0;
+        self.browse_scroll = 0;
+        self.last_browse_click = None;
     }
 
     pub fn exit_browse_mode(&mut self) {
@@ -228,36 +261,46 @@ impl App {
     }
 
     pub fn browse_up(&mut self) {
+        let total = self.browse_entries.len() + 1; // +1 for current-dir row
+        if total == 0 {
+            return;
+        }
         if self.browse_selected > 0 {
             self.browse_selected -= 1;
-        } else if !self.browse_entries.is_empty() {
-            self.browse_selected = self.browse_entries.len() - 1;
+        } else {
+            self.browse_selected = total - 1;
         }
+        self.browse_scroll = self.browse_selected;
     }
 
     pub fn browse_down(&mut self) {
-        if !self.browse_entries.is_empty() {
-            if self.browse_selected + 1 < self.browse_entries.len() {
-                self.browse_selected += 1;
-            } else {
-                self.browse_selected = 0;
-            }
+        let total = self.browse_entries.len() + 1;
+        if total == 0 {
+            return;
         }
+        if self.browse_selected + 1 < total {
+            self.browse_selected += 1;
+        } else {
+            self.browse_selected = 0;
+        }
+        self.browse_scroll = self.browse_selected;
     }
 
     pub fn browse_enter(&mut self) {
-        if self.browse_entries.is_empty() {
+        if self.browse_selected == 0 {
+            // Current directory row
             self.select_browse_dir();
             return;
         }
-        let entry = &self.browse_entries[self.browse_selected];
-        if entry.name == ".." {
-            self.browse_parent();
-        } else if entry.is_dir {
-            let new_path = self.browse_cwd.join(&entry.name);
-            self.browse_cwd = new_path;
-            self.browse_entries = Self::list_dir_entries(&self.browse_cwd);
-            self.browse_selected = 0;
+        let entry_idx = self.browse_selected - 1;
+        if let Some(entry) = self.browse_entries.get(entry_idx) {
+            if entry.name == ".." {
+                self.browse_parent();
+            } else if entry.is_dir {
+                let new_path = self.browse_cwd.join(&entry.name);
+                self.browse_cwd = new_path;
+                self._enter_browse();
+            }
         }
     }
 
@@ -270,20 +313,26 @@ impl App {
     }
 
     pub fn select_browse_dir(&mut self) {
-        let path = self.browse_cwd.to_string_lossy().to_string();
+        // Resolve path from selected row, not browse_cwd
+        let path = if self.browse_selected == 0 {
+            self.browse_cwd.to_string_lossy().to_string()
+        } else if let Some(entry) = self.browse_entries.get(self.browse_selected - 1) {
+            self.browse_cwd
+                .join(&entry.name)
+                .to_string_lossy()
+                .to_string()
+        } else {
+            self.browse_cwd.to_string_lossy().to_string()
+        };
 
         if let Some(idx) = self.browse_target_index {
-            // Replace existing entry
             if idx < self.dirs.len() {
                 self.dirs[idx] = path.clone();
             }
-            self.ensure_empty_slot();
-            self.message = format!("Path set to: {}", path);
+            self.message = format!("Path updated: {}", path);
         } else {
             if !self.dirs.iter().any(|d| d == &path) {
-                let empty_idx = self.dirs.len().saturating_sub(1);
-                self.dirs.insert(empty_idx, path.clone());
-                self.ensure_empty_slot();
+                self.dirs.push(path.clone());
                 self.message = format!("Added directory: {}", path);
             } else {
                 self.message = format!("Directory already in list: {}", path);
@@ -291,6 +340,16 @@ impl App {
         }
 
         self.exit_browse_mode();
+    }
+
+    pub fn add_new_path_via_browse(&mut self) {
+        self.enter_browse_mode();
+    }
+
+    pub fn edit_path_via_browse(&mut self) {
+        if self.dir_selected < self.dirs.len() && !self.dirs[self.dir_selected].trim().is_empty() {
+            self.enter_browse_mode_for_index(self.dir_selected);
+        }
     }
 
     pub fn list_dir_entries(cwd: &PathBuf) -> Vec<BrowseEntry> {
@@ -352,14 +411,54 @@ impl App {
         }
     }
 
+    // ── Filter text editing ──
+
+    pub fn insert_filter_char(&mut self, c: char) {
+        let pos = self.filter_text_cursor;
+        self.filter_text.insert(pos, c);
+        self.filter_text_cursor += c.len_utf8();
+    }
+
+    pub fn delete_filter_char(&mut self) {
+        if self.filter_text_cursor > 0 {
+            let before = &self.filter_text[..self.filter_text_cursor];
+            if let Some(c) = before.chars().last() {
+                self.filter_text_cursor -= c.len_utf8();
+                self.filter_text.remove(self.filter_text_cursor);
+            }
+        }
+    }
+
+    pub fn move_filter_cursor_left(&mut self) {
+        if self.filter_text_cursor > 0 {
+            let before = &self.filter_text[..self.filter_text_cursor];
+            if let Some(c) = before.chars().last() {
+                self.filter_text_cursor -= c.len_utf8();
+            }
+        }
+    }
+
+    pub fn move_filter_cursor_right(&mut self) {
+        if self.filter_text_cursor < self.filter_text.len() {
+            let after = &self.filter_text[self.filter_text_cursor..];
+            if let Some(c) = after.chars().next() {
+                self.filter_text_cursor += c.len_utf8();
+            }
+        }
+    }
+
     // ── Other helpers ──
 
     pub fn filtered_results(&self) -> Vec<&ScanResult> {
+        let mut out: Vec<&ScanResult> = self.results.iter().collect();
         if let Some(ref ft) = self.filter {
-            self.results.iter().filter(|r| r.file_type == *ft).collect()
-        } else {
-            self.results.iter().collect()
+            out.retain(|r| r.file_type == *ft);
         }
+        if !self.filter_text.is_empty() {
+            let q = self.filter_text.to_lowercase();
+            out.retain(|r| r.path.to_string_lossy().to_lowercase().contains(&q));
+        }
+        out
     }
 
     pub fn config_left_row_up(&mut self) {
@@ -482,5 +581,10 @@ impl App {
                 self.command_cursor += c.len_utf8();
             }
         }
+    }
+
+    pub fn set_filter_type(&mut self, ft: Option<FileType>) {
+        self.filter = ft;
+        self.selected = 0;
     }
 }

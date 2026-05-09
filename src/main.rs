@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use app::{App, FileType, Focus, Mode, ScanResult};
+use app::{App, FileType, Focus, Mode, ScanResult, UiRects};
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 use walkdir::WalkDir;
@@ -41,7 +41,13 @@ fn main() {
         args.pdf,
     );
 
+    // Enable mouse capture
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+
     let result = run_app(&mut terminal, &mut app);
+
+    // Disable mouse capture on exit
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
 
     ratatui::restore();
     if let Err(e) = result {
@@ -59,19 +65,14 @@ where
     let (scan_tx, scan_rx): (mpsc::Sender<ScanMessage>, mpsc::Receiver<ScanMessage>) =
         mpsc::channel();
 
-    let mut first_frame = true;
+    let mut ui_rects = UiRects::default();
 
     loop {
-        terminal.draw(|f| ui::render(f, app))?;
+        terminal.draw(|f| {
+            ui_rects = ui::render(f, app);
+        })?;
 
-        if first_frame {
-            first_frame = false;
-            if app.auto_scan {
-                app.auto_scan = false;
-                start_scan(app, &scan_tx);
-            }
-        }
-
+        // Drain scan messages
         while let Ok(msg) = scan_rx.try_recv() {
             match msg {
                 ScanMessage::Progress { scanned, total } => {
@@ -116,18 +117,21 @@ where
 
         if event::poll(Duration::from_millis(100))? {
             let event = event::read()?;
-            if let Event::Key(key) = event {
-                if key.kind == KeyEventKind::Release {
-                    continue;
-                }
-                match app.mode {
-                    Mode::Command => handle_command_input(app, key.code),
-                    Mode::Help => {
-                        app.mode = Mode::Normal;
+            match event {
+                Event::Key(key) => {
+                    if key.kind == KeyEventKind::Release {
+                        continue;
                     }
-                    Mode::Browse => handle_browse_input(app, key.code),
-                    Mode::Normal => handle_normal_input(app, key, &scan_tx),
+                    match app.mode {
+                        Mode::Command => handle_command_input(app, key.code),
+                        Mode::Browse => handle_browse_key(app, key.code),
+                        Mode::Normal => handle_normal_key(app, key, &scan_tx, &ui_rects),
+                    }
                 }
+                Event::Mouse(mouse) => {
+                    handle_mouse(app, mouse, &scan_tx, &ui_rects);
+                }
+                _ => {}
             }
         }
     }
@@ -139,28 +143,17 @@ enum ScanMessage {
     Done { dirs: Vec<String>, total: usize },
 }
 
-// ==================== 输入处理 ====================
-//
-// Tab         = 循环焦点: ConfigLeft → ConfigRight → Results → ConfigLeft
-// ↑/↓         = ConfigLeft: 选择参数行 / ConfigRight: 浏览路径 / Results: 浏览结果
-// ←/→         = ConfigLeft: 调整参数 / ConfigRight: —
-// Space       = ConfigLeft+Types: 切换文件类型
-// e           = ConfigRight: 路径选择器编辑
-// d           = ConfigRight: 删除所选路径
-// a           = ConfigRight: 路径选择器新增
-// Enter       = ConfigLeft/ConfigRight: 开始扫描 / Results: 打开文件
-// :           = 命令模式
-// q           = 退出
+// ==================== Key input ====================
 
-fn handle_normal_input(
+fn handle_normal_key(
     app: &mut App,
     key: crossterm::event::KeyEvent,
     scan_tx: &mpsc::Sender<ScanMessage>,
+    _rects: &UiRects,
 ) {
-    // Global keys
+    // Global keys (not in filter input)
     match key.code {
         KeyCode::Char('q') => {
-            // Don't quit when typing 'q' in the keyword field
             if !(app.focus == Focus::ConfigLeft && app.config_left_row == 0) {
                 app.should_quit = true;
                 return;
@@ -172,7 +165,6 @@ fn handle_normal_input(
         }
         KeyCode::Tab => {
             app.focus = app.focus.next();
-            // Clamp selections when switching to panels
             match app.focus {
                 Focus::ConfigRight => {
                     if app.dir_selected >= app.dirs.len().saturating_sub(1) {
@@ -180,6 +172,7 @@ fn handle_normal_input(
                     }
                 }
                 Focus::Results => {
+                    app.filter_focused = false;
                     let max = app.filtered_results().len().saturating_sub(1);
                     if app.selected > max {
                         app.selected = max;
@@ -189,17 +182,23 @@ fn handle_normal_input(
             }
             return;
         }
+        KeyCode::Esc => {
+            app.filter_text.clear();
+            app.filter_text_cursor = 0;
+            app.filter_focused = false;
+            return;
+        }
         _ => {}
     }
 
     match app.focus {
-        Focus::ConfigLeft => handle_config_left(app, key, scan_tx),
-        Focus::ConfigRight => handle_config_right(app, key, scan_tx),
-        Focus::Results => handle_results(app, key, scan_tx),
+        Focus::ConfigLeft => handle_config_left_key(app, key, scan_tx),
+        Focus::ConfigRight => handle_config_right_key(app, key, scan_tx),
+        Focus::Results => handle_results_key(app, key, scan_tx),
     }
 }
 
-fn handle_config_left(
+fn handle_config_left_key(
     app: &mut App,
     key: crossterm::event::KeyEvent,
     scan_tx: &mpsc::Sender<ScanMessage>,
@@ -207,11 +206,9 @@ fn handle_config_left(
     match key.code {
         KeyCode::Up => app.config_left_row_up(),
         KeyCode::Down => app.config_left_row_down(),
-
         KeyCode::Enter => start_scan(app, scan_tx),
 
         _ => match app.config_left_row {
-            // ── Keyword row ──
             0 => match key.code {
                 KeyCode::Left => app.move_query_cursor_left(),
                 KeyCode::Right => app.move_query_cursor_right(),
@@ -219,28 +216,23 @@ fn handle_config_left(
                 KeyCode::Char(c) => app.insert_query_char(c),
                 _ => {}
             },
-
-            // ── Threads row ──
             1 => match key.code {
                 KeyCode::Left => app.threads_dec(),
                 KeyCode::Right => app.threads_inc(),
                 _ => {}
             },
-
-            // ── File types row ──
             2 => match key.code {
                 KeyCode::Left => app.ft_cursor_left(),
                 KeyCode::Right => app.ft_cursor_right(),
                 KeyCode::Char(' ') => app.toggle_file_type(app.ft_cursor),
                 _ => {}
             },
-
             _ => {}
         },
     }
 }
 
-fn handle_config_right(
+fn handle_config_right_key(
     app: &mut App,
     key: crossterm::event::KeyEvent,
     scan_tx: &mpsc::Sender<ScanMessage>,
@@ -248,29 +240,45 @@ fn handle_config_right(
     match key.code {
         KeyCode::Up => app.dir_selected_up(),
         KeyCode::Down => app.dir_selected_down(),
-        KeyCode::Char('e') => {
-            let idx = app.dir_selected;
-            app.enter_browse_mode_for_index(idx);
-        }
-        KeyCode::Char('d') => app.delete_selected_path(),
-        KeyCode::Char('a') => {
-            app.enter_browse_mode();
-        }
         KeyCode::Enter => start_scan(app, scan_tx),
+        KeyCode::Delete | KeyCode::Char('d') => app.delete_selected_path(),
         _ => {}
     }
 }
 
-fn handle_results(
+fn handle_results_key(
     app: &mut App,
     key: crossterm::event::KeyEvent,
     _scan_tx: &mpsc::Sender<ScanMessage>,
 ) {
-    match key.code {
-        KeyCode::Up => app.selected_up(),
-        KeyCode::Down => app.selected_down(),
-        KeyCode::Enter => open_selected_file(app),
-        _ => {}
+    if app.filter_focused {
+        // Typing in filter input
+        match key.code {
+            KeyCode::Esc => {
+                app.filter_text.clear();
+                app.filter_text_cursor = 0;
+                app.filter_focused = false;
+            }
+            KeyCode::Up | KeyCode::Down => app.filter_focused = false,
+            KeyCode::Left => app.move_filter_cursor_left(),
+            KeyCode::Right => app.move_filter_cursor_right(),
+            KeyCode::Backspace => app.delete_filter_char(),
+            KeyCode::Char(c) => app.insert_filter_char(c),
+            _ => {}
+        }
+    } else {
+        // Navigating results list
+        match key.code {
+            KeyCode::Up => app.selected_up(),
+            KeyCode::Down => app.selected_down(),
+            KeyCode::Enter => open_selected_file(app),
+            // Typing switches to filter focus
+            KeyCode::Char(c) => {
+                app.filter_focused = true;
+                app.insert_filter_char(c);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -285,6 +293,301 @@ fn handle_command_input(app: &mut App, key: KeyCode) {
         _ => {}
     }
 }
+
+fn handle_browse_key(app: &mut App, key: KeyCode) {
+    match key {
+        KeyCode::Esc => app.exit_browse_mode(),
+        KeyCode::Up | KeyCode::Char('k') => app.browse_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.browse_down(),
+        KeyCode::Enter => app.browse_enter(),
+        KeyCode::Backspace | KeyCode::Left => app.browse_parent(),
+        KeyCode::Char(' ') => app.select_browse_dir(),
+        KeyCode::Char('~') => {
+            if let Some(home) = dirs_fallback::home_dir() {
+                app.browse_cwd = home;
+                app.browse_entries = App::list_dir_entries(&app.browse_cwd);
+                app.browse_selected = 0;
+            }
+        }
+        KeyCode::Char('/') => {
+            #[cfg(target_os = "windows")]
+            {
+                app.browse_cwd = std::path::PathBuf::from("C:\\");
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                app.browse_cwd = std::path::PathBuf::from("/");
+            }
+            app.browse_entries = App::list_dir_entries(&app.browse_cwd);
+            app.browse_selected = 0;
+        }
+        _ => {}
+    }
+}
+
+// ==================== Mouse input ====================
+
+fn handle_mouse(
+    app: &mut App,
+    mouse: crossterm::event::MouseEvent,
+    scan_tx: &mpsc::Sender<ScanMessage>,
+    rects: &UiRects,
+) {
+    let (col, row) = (mouse.column, mouse.row);
+
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            // ── Browse popup (modal) ──
+            if app.mode == Mode::Browse {
+                if let Some(ref r) = rects.browse_confirm_btn {
+                    if hit(r, col, row) {
+                        app.select_browse_dir();
+                        return;
+                    }
+                }
+                if let Some(ref r) = rects.browse_cancel_btn {
+                    if hit(r, col, row) {
+                        app.exit_browse_mode();
+                        return;
+                    }
+                }
+                // Click on browse row — single=select, double=enter
+                for (i, r) in rects.browse_rows.iter().enumerate() {
+                    if hit(r, col, row) {
+                        let idx = rects.browse_list_start + i;
+                        // Double-click detection (same row, within 400ms)
+                        let now = std::time::Instant::now();
+                        let is_double =
+                            app.last_browse_click
+                                .map_or(false, |(prev_idx, prev_time)| {
+                                    prev_idx == idx
+                                        && now.duration_since(prev_time).as_millis() < 400
+                                });
+                        if is_double {
+                            app.browse_selected = idx;
+                            app.browse_enter();
+                            app.last_browse_click = None;
+                        } else {
+                            app.browse_selected = idx;
+                            app.last_browse_click = Some((idx, now));
+                        }
+                        return;
+                    }
+                }
+                // Click on browse panel but not on rows = ignore
+                if let Some(ref p) = rects.browse_panel {
+                    if hit(p, col, row) {
+                        return;
+                    }
+                }
+                // Click outside browse popup = cancel
+                app.exit_browse_mode();
+                return;
+            }
+
+            // ── Quit button ──
+            if let Some(ref r) = rects.quit_button {
+                if hit(r, col, row) {
+                    app.should_quit = true;
+                    return;
+                }
+            }
+
+            // ── Keyword input ──
+            if let Some(ref r) = rects.keyword_input {
+                if hit(r, col, row) {
+                    app.focus = Focus::ConfigLeft;
+                    app.config_left_row = 0;
+                    return;
+                }
+            }
+
+            // ── Scan button ──
+            if let Some(ref r) = rects.scan_button {
+                if hit(r, col, row) {
+                    start_scan(app, scan_tx);
+                    return;
+                }
+            }
+
+            // ── Threads dec/inc ──
+            if let Some(ref r) = rects.threads_dec_btn {
+                if hit(r, col, row) {
+                    app.threads_dec();
+                    app.focus = Focus::ConfigLeft;
+                    app.config_left_row = 1;
+                    return;
+                }
+            }
+            if let Some(ref r) = rects.threads_inc_btn {
+                if hit(r, col, row) {
+                    app.threads_inc();
+                    app.focus = Focus::ConfigLeft;
+                    app.config_left_row = 1;
+                    return;
+                }
+            }
+
+            // ── Type toggle buttons ──
+            for (i, r) in rects.type_btns.iter().enumerate() {
+                if hit(r, col, row) {
+                    app.toggle_file_type(i);
+                    app.focus = Focus::ConfigLeft;
+                    app.config_left_row = 2;
+                    app.ft_cursor = i;
+                    return;
+                }
+            }
+
+            // ── Path Add / Edit / Delete buttons ──
+            if let Some(ref r) = rects.path_add_btn {
+                if hit(r, col, row) {
+                    app.add_new_path_via_browse();
+                    return;
+                }
+            }
+            if let Some(ref r) = rects.path_edit_btn {
+                if hit(r, col, row) {
+                    app.edit_path_via_browse();
+                    return;
+                }
+            }
+            if let Some(ref r) = rects.path_del_btn {
+                if hit(r, col, row) {
+                    app.delete_selected_path();
+                    return;
+                }
+            }
+
+            // ── Path rows ──
+            for (i, r) in rects.path_rows.iter().enumerate() {
+                if hit(r, col, row) {
+                    app.focus = Focus::ConfigRight;
+                    app.dir_selected = rects.path_list_start + i;
+                    return;
+                }
+            }
+            // Click in paths panel area (but not on a row) → focus
+            if let Some(ref p) = rects.paths_panel {
+                if hit(p, col, row) {
+                    app.focus = Focus::ConfigRight;
+                    return;
+                }
+            }
+
+            // ── Filter input ──
+            if let Some(ref r) = rects.filter_input {
+                if hit(r, col, row) {
+                    app.focus = Focus::Results;
+                    app.filter_focused = true;
+                    return;
+                }
+            }
+
+            // ── Filter type buttons ──
+            for (ft, r) in &rects.filter_type_btns {
+                if hit(r, col, row) {
+                    app.set_filter_type(Some(ft.clone()));
+                    return;
+                }
+            }
+            if let Some(ref r) = rects.filter_all_btn {
+                if hit(r, col, row) {
+                    app.set_filter_type(None);
+                    return;
+                }
+            }
+            if let Some(ref r) = rects.filter_clear_btn {
+                if hit(r, col, row) {
+                    app.filter_text.clear();
+                    app.filter_text_cursor = 0;
+                    app.filter_focused = false;
+                    return;
+                }
+            }
+
+            // ── Result rows ──
+            for (i, r) in rects.result_rows.iter().enumerate() {
+                if hit(r, col, row) {
+                    app.focus = Focus::Results;
+                    app.filter_focused = false;
+                    app.selected = rects.result_list_start + i;
+                    return;
+                }
+            }
+            // Click in results panel area → focus
+            if let Some(ref p) = rects.results_panel {
+                if hit(p, col, row) {
+                    app.focus = Focus::Results;
+                    return;
+                }
+            }
+
+            // Click elsewhere in params area → focus keyword
+            app.focus = Focus::ConfigLeft;
+            app.config_left_row = 0;
+        }
+
+        MouseEventKind::ScrollDown => {
+            // Browse popup has priority when open (modal)
+            if app.mode == Mode::Browse {
+                if let Some(ref p) = rects.browse_panel {
+                    if hit(p, col, row) {
+                        app.browse_down();
+                        return;
+                    }
+                }
+            }
+            if let Some(ref p) = rects.paths_panel {
+                if hit(p, col, row) {
+                    app.focus = Focus::ConfigRight;
+                    app.dir_selected_down();
+                    return;
+                }
+            }
+            if let Some(ref p) = rects.results_panel {
+                if hit(p, col, row) {
+                    app.focus = Focus::Results;
+                    app.selected_down();
+                    return;
+                }
+            }
+        }
+
+        MouseEventKind::ScrollUp => {
+            if app.mode == Mode::Browse {
+                if let Some(ref p) = rects.browse_panel {
+                    if hit(p, col, row) {
+                        app.browse_up();
+                        return;
+                    }
+                }
+            }
+            if let Some(ref p) = rects.paths_panel {
+                if hit(p, col, row) {
+                    app.focus = Focus::ConfigRight;
+                    app.dir_selected_up();
+                    return;
+                }
+            }
+            if let Some(ref p) = rects.results_panel {
+                if hit(p, col, row) {
+                    app.focus = Focus::Results;
+                    app.selected_up();
+                    return;
+                }
+            }
+        }
+
+        _ => {}
+    }
+}
+
+fn hit(rect: &ratatui::layout::Rect, col: u16, row: u16) -> bool {
+    col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+}
+
+// ==================== File open ====================
 
 fn open_selected_file(app: &mut App) {
     let filtered = app.filtered_results();
@@ -308,17 +611,17 @@ fn open_selected_file(app: &mut App) {
     }
 }
 
-// ==================== 扫描逻辑 ====================
+// ==================== Scan logic ====================
 
 fn start_scan(app: &mut App, tx: &mpsc::Sender<ScanMessage>) {
     if app.query.is_empty() {
-        app.message = "No query set. Type keyword or use :query <text>.".to_string();
+        app.message = "No query set. Type a keyword first.".to_string();
         return;
     }
 
     let enabled_exts = app.enabled_extensions();
     if enabled_exts.is_empty() {
-        app.message = "Enable at least one file type (←→ Space in Types).".to_string();
+        app.message = "Enable at least one file type.".to_string();
         return;
     }
 
@@ -329,7 +632,7 @@ fn start_scan(app: &mut App, tx: &mpsc::Sender<ScanMessage>) {
         .map(|d| d.trim().to_string())
         .collect();
     if dirs.is_empty() {
-        app.message = "No directories set. Use :dir add <path>.".to_string();
+        app.message = "No directories set. Click + Add in the Paths panel.".to_string();
         return;
     }
 
@@ -341,6 +644,10 @@ fn start_scan(app: &mut App, tx: &mpsc::Sender<ScanMessage>) {
     app.scanned_files = 0;
     app.total_files = 0;
     app.selected = 0;
+    app.filter_text.clear();
+    app.filter_text_cursor = 0;
+    app.filter_focused = false;
+    app.filter = None;
     app.message = format!(
         "Scanning '{}' in [{}] with {} threads...",
         keyword,
@@ -431,40 +738,6 @@ fn start_scan(app: &mut App, tx: &mpsc::Sender<ScanMessage>) {
 
         let _ = tx.send(ScanMessage::Done { dirs, total });
     });
-}
-
-// ==================== Browse input ====================
-
-fn handle_browse_input(app: &mut App, key: KeyCode) {
-    match key {
-        KeyCode::Esc => app.exit_browse_mode(),
-        KeyCode::Up | KeyCode::Char('k') => app.browse_up(),
-        KeyCode::Down | KeyCode::Char('j') => app.browse_down(),
-        KeyCode::Enter => app.browse_enter(),
-        KeyCode::Backspace | KeyCode::Left => app.browse_parent(),
-        KeyCode::Char(' ') => app.select_browse_dir(),
-        KeyCode::Char('~') => {
-            if let Some(home) = dirs_fallback::home_dir() {
-                app.browse_cwd = home;
-                app.browse_entries = App::list_dir_entries(&app.browse_cwd);
-                app.browse_selected = 0;
-            }
-        }
-        KeyCode::Char('/') => {
-            // Go to root (or C:\ on Windows)
-            #[cfg(target_os = "windows")]
-            {
-                app.browse_cwd = std::path::PathBuf::from("C:\\");
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                app.browse_cwd = std::path::PathBuf::from("/");
-            }
-            app.browse_entries = App::list_dir_entries(&app.browse_cwd);
-            app.browse_selected = 0;
-        }
-        _ => {}
-    }
 }
 
 /// Fallback home directory for platforms without dirs crate

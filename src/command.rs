@@ -17,7 +17,6 @@ pub fn execute(app: &mut App) {
             app.should_quit = true;
         }
 
-        // ── 配置命令 ──
         "query" | "k" => {
             if arg.is_empty() {
                 app.message = format!("Current query: '{}'", app.query);
@@ -54,10 +53,7 @@ pub fn execute(app: &mut App) {
                     if sub_arg.is_empty() {
                         app.message = "Usage: :dir add <path>".to_string();
                     } else {
-                        // Insert before the empty slot
-                        let empty_idx = app.dirs.len().saturating_sub(1);
-                        app.dirs.insert(empty_idx, sub_arg.to_string());
-                        app.ensure_empty_slot();
+                        app.dirs.push(sub_arg.to_string());
                         app.message = format!("Added directory: {}", sub_arg);
                     }
                 }
@@ -76,14 +72,12 @@ pub fn execute(app: &mut App) {
                         let pos = index.saturating_sub(1).min(active.len().saturating_sub(1));
                         let real_idx = active[pos];
                         let removed = app.dirs.remove(real_idx);
-                        app.ensure_empty_slot();
                         app.message = format!("Removed: {}", removed);
                     }
                 }
                 "clear" | "c" => {
                     let count = app.active_dirs().len();
                     app.dirs.clear();
-                    app.dirs.push(String::new());
                     app.dir_selected = 0;
                     app.message = format!(
                         "Cleared {} director{}.",
@@ -102,7 +96,6 @@ pub fn execute(app: &mut App) {
             }
         }
 
-        // ── 过滤 ──
         "filter" | "f" => {
             if arg.is_empty() || arg == "clear" {
                 app.filter = None;
@@ -129,13 +122,8 @@ pub fn execute(app: &mut App) {
             }
         }
 
-        "help" | "?" => {
-            app.mode = crate::app::Mode::Help;
-            return;
-        }
-
         _ => {
-            app.message = format!("Unknown: {}. Try :help", action);
+            app.message = format!("Unknown: {}. Try :q :query :threads :dir :filter", action);
         }
     }
 
