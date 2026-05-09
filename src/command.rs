@@ -115,6 +115,7 @@ pub fn execute(app: &mut App) {
                     "word" | "docx" | "doc" | "wps" => Some(0),
                     "excel" | "xlsx" | "xls" | "et" => Some(1),
                     "pdf" => Some(2),
+                    "text" | "txt" => Some(3),
                     _ => None,
                 };
                 match idx {
@@ -128,7 +129,7 @@ pub fn execute(app: &mut App) {
                         );
                     }
                     None => {
-                        app.message = "Unknown type. Use: word, excel, pdf".to_string();
+                        app.message = "Unknown type. Use: word, excel, pdf, text".to_string();
                     }
                 }
             }
@@ -144,6 +145,7 @@ pub fn execute(app: &mut App) {
                     "word" | "docx" | "doc" | "wps" => Some(crate::app::FileType::Word),
                     "excel" | "xlsx" | "xls" | "et" => Some(crate::app::FileType::Excel),
                     "pdf" => Some(crate::app::FileType::Pdf),
+                    "text" | "txt" => Some(crate::app::FileType::Text),
                     _ => None,
                 };
                 match ft {
@@ -154,7 +156,8 @@ pub fn execute(app: &mut App) {
                         app.message = format!("Filter: {}", label);
                     }
                     None => {
-                        app.message = "Unknown type. Use: word, excel, pdf, or clear.".to_string();
+                        app.message =
+                            "Unknown type. Use: word, excel, pdf, text, or clear.".to_string();
                     }
                 }
             }

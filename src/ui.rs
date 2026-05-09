@@ -479,7 +479,12 @@ fn render_results_panel(f: &mut Frame, app: &App, area: Rect, rects: &mut UiRect
     rects.filter_type_btns.clear();
     let mut bx = inner.x + input_w + 2;
 
-    for ft in &[FileType::Word, FileType::Excel, FileType::Pdf] {
+    for ft in &[
+        FileType::Word,
+        FileType::Excel,
+        FileType::Pdf,
+        FileType::Text,
+    ] {
         let label = ft.short_label();
         let is_active = app.filter.as_ref() == Some(ft);
         let bstyle = if is_active {
