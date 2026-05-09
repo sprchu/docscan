@@ -2,6 +2,12 @@
 name = "docscan"
 version = "0.1.0"
 edition = "2024"
+description = "A TUI document search tool for Word, Excel, PDF, and plain text files"
+license = "MIT"
+repository = "https://github.com/sprchu/docscan"
+keywords = ["search", "documents", "tui", "cli", "office"]
+categories = ["command-line-utilities", "text-processing"]
+authors = ["sprchu"]
 
 [dependencies]
 anyhow = "1.0.102"

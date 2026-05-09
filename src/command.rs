@@ -1,3 +1,8 @@
+//! Command execution engine.
+//!
+//! Parses and executes `:`-prefixed commands entered in the status bar.
+//! Supported commands: `:q`, `:k`, `:j`, `:type`, `:filter`, `:dir`.
+
 use crate::app::App;
 
 pub fn execute(app: &mut App) {

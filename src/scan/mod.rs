@@ -1,3 +1,13 @@
+//! Pluggable scanner architecture.
+//!
+//! ## Adding a new scanner
+//!
+//! 1. Create a module implementing the [`Scanner`] trait
+//! 2. Register it in [`all_scanners()`]
+//! 3. Add a `FileType` variant and its extensions in [`crate::app::types`]
+//!
+//! See [`text`] for a minimal example.
+
 pub mod doc;
 pub mod docx;
 pub mod excel;

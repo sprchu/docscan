@@ -1,3 +1,11 @@
+//! DocScan — a blazingly fast TUI document search tool.
+//!
+//! Search keywords across Word, Excel, PDF, and plain text files
+//! in parallel, with an interactive terminal interface.
+//!
+//! This crate entry point parses CLI args, initialises the terminal,
+//! and runs the main event loop.
+
 mod app;
 mod command;
 mod scan;
@@ -13,18 +21,18 @@ use clap::Parser;
 use crossterm::event::{self, Event};
 
 #[derive(Parser, Debug)]
-#[command(version, about = "word/excel/pdf/text 文档搜索工具")]
+#[command(version, about = "Document search — Word, Excel, PDF, plain text")]
 struct Args {
-    #[arg(short, help = "待搜索字符串")]
+    #[arg(short, help = "keywords to search for")]
     query: Option<String>,
 
-    #[arg(short, default_value_t = num_cpus::get(), help = "并发线程数")]
+    #[arg(short, default_value_t = num_cpus::get(), help = "number of concurrent threads")]
     jobs: usize,
 
-    #[arg(short, long, default_value_t = false, help = "是否搜索PDF文件")]
+    #[arg(short, long, default_value_t = false, help = "search PDF files")]
     pdf: bool,
 
-    #[arg(help = "扫描目录列表")]
+    #[arg(help = "directories to scan")]
     dirs: Vec<String>,
 }
 
