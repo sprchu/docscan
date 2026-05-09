@@ -153,12 +153,6 @@ fn handle_normal_key(
 ) {
     // Global keys (not in filter input)
     match key.code {
-        KeyCode::Char('q') => {
-            if !(app.focus == Focus::ConfigLeft && app.config_left_row == 0) {
-                app.should_quit = true;
-                return;
-            }
-        }
         KeyCode::Char(':') => {
             app.enter_command_mode();
             return;

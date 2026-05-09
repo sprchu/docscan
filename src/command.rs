@@ -96,6 +96,44 @@ pub fn execute(app: &mut App) {
             }
         }
 
+        "type" | "ft" => {
+            if arg.is_empty() {
+                let status: Vec<String> = app
+                    .file_types
+                    .iter()
+                    .map(|(ft, enabled)| {
+                        format!(
+                            "{}: {}",
+                            ft.short_label(),
+                            if *enabled { "ON" } else { "OFF" }
+                        )
+                    })
+                    .collect();
+                app.message = format!("File types: {}", status.join(", "));
+            } else {
+                let idx = match arg.to_lowercase().as_str() {
+                    "word" | "docx" | "doc" | "wps" => Some(0),
+                    "excel" | "xlsx" | "xls" | "et" => Some(1),
+                    "pdf" => Some(2),
+                    _ => None,
+                };
+                match idx {
+                    Some(i) => {
+                        app.toggle_file_type(i);
+                        let (ft, enabled) = &app.file_types[i];
+                        app.message = format!(
+                            "{}: {}",
+                            ft.short_label(),
+                            if *enabled { "ON" } else { "OFF" }
+                        );
+                    }
+                    None => {
+                        app.message = "Unknown type. Use: word, excel, pdf".to_string();
+                    }
+                }
+            }
+        }
+
         "filter" | "f" => {
             if arg.is_empty() || arg == "clear" {
                 app.filter = None;
@@ -123,7 +161,10 @@ pub fn execute(app: &mut App) {
         }
 
         _ => {
-            app.message = format!("Unknown: {}. Try :q :query :threads :dir :filter", action);
+            app.message = format!(
+                "Unknown: {}. Try :q :query :threads :dir :type :filter",
+                action
+            );
         }
     }
 
